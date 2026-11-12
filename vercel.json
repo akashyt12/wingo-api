@@ -1,7 +1,10 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
     "wingo-api": {
       "root": ".",
+      "framework": "fastapi",
+      "entrypoint": "app:app",
       "buildCommand": "pip install -r requirements.txt"
     }
   },
