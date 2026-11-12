@@ -66,6 +66,68 @@ app.add_middleware(
 _lock = threading.Lock()
 _state: dict[str, Any] = {"ts": 0.0, "data": None}
 
+# --- Win/Loss session tracking (in-memory; resets on cold start) ---
+_pending: dict[str, dict[str, Any]] = {}          # period -> pick
+_session: dict[str, Any] = {
+    "size_wins": 0, "size_losses": 0,
+    "col_wins": 0, "col_losses": 0,
+    "total": 0, "recent": [],
+}
+_MAX_RESOLVED = 50
+
+
+def _resolve_pending(records: list[dict]) -> None:
+    """Score any pending picks whose period has now completed."""
+    by_period = {r["issueNumber"]: r for r in records}
+    now = time.time()
+    for period in list(_pending):
+        pick = _pending[period]
+        rec = by_period.get(period)
+        if rec is None:
+            if now - pick.get("ts", now) > 400:
+                _pending.pop(period, None)
+            continue
+        actual_size = "BIG" if rec["size"] == 1 else "SMALL"
+        actual_cols = [
+            c for c, f in (
+                ("RED", rec["red"]), ("GREEN", rec["green"]), ("VIOLET", rec["violet"])
+            ) if f
+        ]
+        size_hit = pick["size"] == actual_size
+        col_hit = pick["colour"] in actual_cols
+        _session["size_wins"] += int(size_hit)
+        _session["size_losses"] += int(not size_hit)
+        _session["col_wins"] += int(col_hit)
+        _session["col_losses"] += int(not col_hit)
+        _session["total"] += 1
+        _session["recent"].insert(0, {
+            "period": period,
+            "size": pick["size"],
+            "colour": pick["colour"],
+            "size_hit": size_hit,
+            "col_hit": col_hit,
+            "actual_number": rec["number"],
+            "actual_size": actual_size,
+            "actual_colour": "+".join(actual_cols),
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        })
+        _pending.pop(period, None)
+    _session["recent"] = _session["recent"][:_MAX_RESOLVED]
+
+
+def _session_block() -> dict[str, Any]:
+    total = _session["total"]
+    return {
+        "total": total,
+        "size_wins": _session["size_wins"],
+        "size_losses": _session["size_losses"],
+        "col_wins": _session["col_wins"],
+        "col_losses": _session["col_losses"],
+        "size_acc": round(_session["size_wins"] / total * 100, 1) if total else None,
+        "col_acc": round(_session["col_wins"] / total * 100, 1) if total else None,
+        "recent": _session["recent"][:10],
+    }
+
 
 def _jsonable(obj: Any) -> Any:
     if isinstance(obj, np.generic):
@@ -83,9 +145,36 @@ def _build_payload(records: list[dict]) -> dict[str, Any]:
     tok, feat, meta = P.prepare_live_inputs(records)
     pred = ENGINE.predict(tok, feat)
     rule = P.rule_predict(records)
+
+    # Score completed picks, then register the new one.
+    _resolve_pending(records)
+    next_issue = meta["next_issue"]
+    _pending[next_issue] = {
+        "period": next_issue,
+        "size": pred["pred_size"],
+        "colour": pred["primary_colour"],
+        "ts": time.time(),
+    }
+
+    last = _session["recent"][0] if _session["recent"] else None
+    last_pick = None
+    if last:
+        last_pick = {
+            "period": last["period"],
+            "size": last["size"],
+            "colour": last["colour"],
+            "size_hit": last["size_hit"],
+            "col_hit": last["col_hit"],
+            "size_mark": "\u2713" if last["size_hit"] else "\u2717",
+            "col_mark": "\u2713" if last["col_hit"] else "\u2717",
+            "actual_number": last["actual_number"],
+            "actual_size": last["actual_size"],
+            "actual_colour": last["actual_colour"],
+        }
+
     return {
         "status": "ok",
-        "period": meta["next_issue"],
+        "period": next_issue,
         "prediction": {
             "size": pred["pred_size"],
             "big_small": pred["pred_size"],
@@ -93,6 +182,8 @@ def _build_payload(records: list[dict]) -> dict[str, Any]:
             "colours": pred["multilabel_colours"].split("+"),
             "violet_alert": pred["violet_alert"],
         },
+        "last_pick": last_pick,
+        "session": _session_block(),
         "probabilities": {
             "big": round(pred["p_big"], 6),
             "small": round(pred["p_small"], 6),
@@ -189,45 +280,63 @@ _UI_HTML = """<!doctype html>
 <style>
   body{margin:0;background:#0e1117;color:#e6e6e6;font-family:Consolas,Menlo,monospace;
        display:flex;justify-content:center;align-items:center;min-height:100vh}
-  .card{width:340px;border:1px solid #2a2f3a;border-radius:14px;background:#161b22;
+  .card{width:360px;border:1px solid #2a2f3a;border-radius:14px;background:#161b22;
         padding:18px 20px;box-shadow:0 8px 30px rgba(0,0,0,.5)}
   h1{font-size:18px;letter-spacing:3px;text-align:center;margin:0 0 12px;color:#8ab4ff}
-  .row{display:flex;justify-content:space-between;padding:7px 0;font-size:14px}
+  .row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:14px}
   .sep{border-top:1px dashed #2a2f3a;margin:8px 0}
   .label{color:#8b949e}
   .big{color:#3fb950;font-weight:700}.small{color:#f0883e;font-weight:700}
   .red{color:#f85149}.green{color:#3fb950}.violet{color:#bc8cff}
+  .win{color:#3fb950;font-weight:700}.loss{color:#f85149;font-weight:700}
   .issue{font-size:20px;font-weight:700;letter-spacing:1px}
-  .muted{color:#6e7681;font-size:11px;text-align:center;margin-top:12px}
+  .muted{color:#6e7681;font-size:11px;text-align:center;margin-top:10px}
   .err{color:#f85149;text-align:center;font-size:12px}
+  .marks{letter-spacing:2px;font-size:15px}
 </style></head><body>
 <div class="card">
   <h1>1MIN WINGO</h1>
   <div class="row"><span class="label">Latest</span><span id="latest">--</span></div>
   <div class="sep"></div>
+  <div class="row"><span class="label">LAST PICK</span>
+    <span><span id="lp">--</span> <span id="lsm"></span>
+    &nbsp;&nbsp;Colour: <span id="lc">--</span> <span id="lcm"></span></span></div>
   <div class="row"><span class="label">NEXT PREDICTION</span><span></span></div>
   <div class="row"><span class="issue" id="period">-----</span><span id="size" class="big">--</span></div>
   <div class="row"><span class="label">Colour</span><span id="colour">--</span></div>
   <div class="sep"></div>
-  <div class="row"><span class="label">P(BIG)</span><span id="pbig">--</span></div>
+  <div class="row"><span class="label">Session</span><span id="sess">--</span></div>
+  <div class="row"><span class="label">Recent</span><span class="marks" id="recent"></span></div>
   <div class="muted" id="foot">loading...</div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
-function cls(v){return v==='BIG'?'big':'small';}
-function ccls(v){return v==='RED'?'red':v==='GREEN'?'green':'violet';}
+const cls=v=>v==='BIG'?'big':'small';
+const ccls=v=>v==='RED'?'red':v==='GREEN'?'green':'violet';
 async function tick(){
   try{
     const r=await fetch('/predict?fresh=true',{cache:'no-store'});
     if(!r.ok) throw new Error('HTTP '+r.status);
     const d=await r.json();
     $('latest').textContent=`${d.latest_result.period.slice(-5)} ${d.latest_result.number} ${d.latest_result.size}`;
+    if(d.last_pick){
+      $('lp').textContent=`${d.last_pick.period.slice(-5)} - ${d.last_pick.size}`;
+      $('lsm').textContent=d.last_pick.size_mark;
+      $('lsm').className=d.last_pick.size_hit?'win':'loss';
+      $('lc').textContent=d.last_pick.colour;
+      $('lcm').textContent=d.last_pick.col_mark;
+      $('lcm').className=d.last_pick.col_hit?'win':'loss';
+    }
     $('period').textContent=d.period.slice(-5);
     $('size').textContent=d.prediction.size;
     $('size').className=cls(d.prediction.size);
     $('colour').textContent=d.prediction.colour;
     $('colour').className=ccls(d.prediction.colour);
-    $('pbig').textContent=(d.probabilities.big*100).toFixed(2)+'%';
+    const s=d.session;
+    if(s.total>0){
+      $('sess').textContent=`Size ${s.size_wins}/${s.total} (${s.size_acc}%) | Colour ${s.col_wins}/${s.total} (${s.col_acc}%)`;
+      $('recent').innerHTML=s.recent.map(x=>`<span class="${x.size_hit?'win':'loss'}">${x.size_hit?'\\u2713':'\\u2717'}</span>`).join('');
+    }
     $('foot').textContent=`${d.model.backend} | ${new Date(d.generated_at).toLocaleTimeString()}`;
   }catch(e){$('foot').innerHTML='<span class="err">'+e.message+'</span>';}
 }
