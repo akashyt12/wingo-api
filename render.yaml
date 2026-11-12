@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: wingo-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: WINGO_FORCE_NUMPY
+        value: "1"
+      - key: CACHE_TTL
+        value: "3"
