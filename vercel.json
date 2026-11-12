@@ -1,0 +1,17 @@
+{
+  "services": {
+    "wingo-api": {
+      "root": ".",
+      "buildCommand": "pip install -r requirements.txt"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": {
+        "type": "service",
+        "service": "wingo-api"
+      }
+    }
+  ]
+}
